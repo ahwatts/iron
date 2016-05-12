@@ -1,9 +1,6 @@
 //! HTTP/HTTPS URL type for Iron.
 
-use url::{Host, RelativeSchemeData};
-use url::{whatwg_scheme_type_mapper};
-use url::{self, SchemeData, SchemeType};
-use url::format::{PathFormatter, UserInfoFormatter};
+use url::{self, Host};
 use std::fmt;
 
 /// HTTP/HTTPS URL type for Iron.
@@ -70,70 +67,72 @@ impl Url {
     /// Create a `Url` from a `rust-url` `Url`.
     pub fn from_generic_url(raw_url: url::Url) -> Result<Url, String> {
         // Create an Iron URL by extracting the special scheme data.
-        match raw_url.scheme_data {
-            SchemeData::Relative(data) => {
-                // Extract the port as a 16-bit unsigned integer.
-                let port: u16 = match data.port {
-                    // If explicitly defined, unwrap it.
-                    Some(port) => port,
-
-                    // Otherwise, use the scheme's default port.
-                    None => {
-                        match whatwg_scheme_type_mapper(&raw_url.scheme) {
-                            SchemeType::Relative(port) => port,
-                            _ => return Err(format!("Invalid special scheme: `{}`",
-                                                    raw_url.scheme))
-                        }
-                    }
-                };
-
-                // Map empty usernames to None.
-                let username = match &*data.username {
-                    "" => None,
-                    _ => Some(data.username)
-                };
-
-                // Map empty passwords to None.
-                let password = match data.password {
-                    None => None,
-                    Some(ref x) if x.is_empty() => None,
-                    Some(password) => Some(password)
-                };
-
-                Ok(Url {
-                    scheme: raw_url.scheme,
-                    host: data.host,
-                    port: port,
-                    path: data.path,
-                    username: username,
-                    password: password,
-                    query: raw_url.query,
-                    fragment: raw_url.fragment
-                })
-            },
-            _ => Err(format!("Not a special scheme: `{}`", raw_url.scheme))
+        if raw_url.cannot_be_a_base() {
+            return Err(format!("Not a special scheme: `{}`", raw_url.scheme()));
         }
+
+        // Extract the host as a string.
+        let host = match raw_url.host() {
+            Some(host) => host.to_owned(),
+            None => return Err(format!("Invalid special scheme: `{}`", raw_url.scheme())),
+        };
+
+        // Extract the port as a 16-bit unsigned integer.
+        let port: u16 = match raw_url.port_or_known_default() {
+            Some(port) => port,
+            None => return Err(format!("Invalid special scheme: `{}`", raw_url.scheme())),
+        };
+
+        // Map empty usernames to None.
+        let username = match raw_url.username() {
+            "" => None,
+            username @ _ => Some(username.to_owned()),
+        };
+
+        // Map empty passwords to None.
+        let password = match raw_url.password() {
+            None => None,
+            Some(ref x) if x.is_empty() => None,
+            Some(password) => Some(password.to_owned())
+        };
+
+        let path: Vec<String> = match raw_url.path_segments() {
+            Some(segments) => segments.map(|s| s.to_owned()).collect(),
+            None => vec![ raw_url.path().to_owned() ],
+        };
+
+        Ok(Url {
+            scheme: raw_url.scheme().to_owned(),
+            host: host,
+            port: port,
+            path: path,
+            username: username,
+            password: password,
+            query: raw_url.query().map(|q| q.to_owned()),
+            fragment: raw_url.fragment().map(|f| f.to_owned()),
+        })
     }
 
     /// Create a `rust-url` `Url` from a `Url`.
     pub fn into_generic_url(self) -> url::Url {
-        let default_port = whatwg_scheme_type_mapper(&self.scheme).default_port();
+        let mut result = url::Url::parse("http://www.example.com/").unwrap();
+        result.set_scheme(&self.scheme).unwrap();
+        result.set_username(self.username.as_ref().map(|u| u.as_str()).unwrap_or("")).unwrap();
+        result.set_password(self.password.as_ref().map(|p| p.as_str())).unwrap();
+        result.set_host(Some(&self.host.to_string())).unwrap();
 
-        url::Url {
-            scheme: self.scheme,
-            scheme_data: SchemeData::Relative(
-                RelativeSchemeData {
-                    username: self.username.unwrap_or(String::new()),
-                    password: self.password,
-                    host: self.host,
-                    port: if Some(self.port) != default_port { Some(self.port) } else { None },
-                    default_port: default_port,
-                    path: self.path
-                }
-            ),
-            query: self.query,
-            fragment: self.fragment
-        }
+        result.set_port(None).unwrap();
+        let default_port = result.port_or_known_default();
+        result.set_port(if Some(self.port) != default_port {
+            Some(self.port)
+        } else {
+            None
+        }).unwrap();
+        result.set_path(&self.path.join("/"));
+        result.set_query(self.query.as_ref().map(|q| q.as_str()));
+        result.set_fragment(self.fragment.as_ref().map(|q| q.as_str()));
+
+        result
     }
 }
 
@@ -144,10 +143,15 @@ impl fmt::Display for Url {
         try!("://".fmt(formatter));
 
         // Write the user info.
-        try!(write!(formatter, "{}", UserInfoFormatter {
-            username: self.username.as_ref().map_or("", |s| &**s),
-            password: self.password.as_ref().map(|s| &**s)
-        }));
+        match (&self.username, &self.password) {
+            (&Some(ref username), &Some(ref password)) => {
+                try!(write!(formatter, "{}:{}@", username, password));
+            },
+            (&Some(ref username), &None) if !username.is_empty() => {
+                try!(write!(formatter, "{}@", username));
+            },
+            _ => {},
+        }
 
         // Write the host.
         try!(self.host.fmt(formatter));
@@ -159,8 +163,9 @@ impl fmt::Display for Url {
                 try!(self.port.fmt(formatter));
         }
 
-        // Write the path.
-        try!(write!(formatter, "{}", PathFormatter { path: &self.path }));
+        // // Write the path.
+        // try!(write!(formatter, "{}", PathFormatter { path: &self.path }));
+        try!(write!(formatter, "/{}", self.path.join("/")));
 
         // Write the query.
         match self.query {
